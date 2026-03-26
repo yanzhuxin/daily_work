@@ -25,10 +25,9 @@ def load_and_preprocess_data(df):
 
     # 处理统计日期，提取日期部分
     df["统计日期"] = pd.to_datetime(df["统计日期"]).dt.date
-    # 统计日期-1天，还原数据真实时间
-    df["统计日期"] = df["统计日期"] - pd.Timedelta(days=1)
-    # 提取月份
-    df["月份"] = df["统计日期"].apply(lambda x: x.strftime("%Y-%m"))
+    # 保持原始日期，已经在数据源做过偏移
+    # 提取月份 = 合并月份，所以直接用合并月份
+    df["月份"] = df["合并月份"]
     return df
 
 
@@ -106,8 +105,35 @@ def calculate_monthly_metrics(df, latest_day, prev_day):
 
     return merged
 
-def generate_markdown_report(monthly_result, latest_day, prev_day, output_path):
+
+def calculate_customer_dimension(df, latest_day, prev_day, month):
+    """对波动大的月份下钻到客户维度"""
+    # 筛选指定月份，分别汇总两天客户数据
+    latest_agg = df[(df["统计日期"] == latest_day) & (df["月份"] == month)].groupby(["客户_new"])[
+        ["计费金额", "成本金额", "毛利_new", "计费带宽G"]
+    ].sum().reset_index()
+
+    prev_agg = df[(df["统计日期"] == prev_day) & (df["月份"] == month)].groupby(["客户_new"])[
+        ["计费金额", "成本金额", "毛利_new", "计费带宽G"]
+    ].sum().reset_index()
+
+    # 合并数据
+    merged = pd.merge(
+        prev_agg, latest_agg, on=["客户_new"], how="outer", suffixes=("_prev", "_latest")
+    ).fillna(0)
+
+    # 计算变化
+    merged["毛利_diff"] = merged["毛利_new_latest"] - merged["毛利_new_prev"]
+    merged["毛利_diff_abs"] = abs(merged["毛利_diff"])
+    # 只筛选变化绝对值大于10万的客户
+    merged = merged[merged["毛利_diff_abs"] > 100000]
+    merged = merged.sort_values("毛利_diff_abs", ascending=False).reset_index(drop=True)
+    
+    return merged
+
+def generate_markdown_report(df, monthly_result, latest_day, prev_day, output_path):
     """生成Markdown格式的分析报告"""
+    datetime_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     report_content = """# 月维度前后两日波动分析报告（排除七牛CDN）
 生成时间: {datetime_now}
 对比日期: {prev_day} (昨日) → {latest_day} (今日)
@@ -118,9 +144,7 @@ def generate_markdown_report(monthly_result, latest_day, prev_day, output_path):
 ## 一、整体汇总对比
 | 指标       | 昨日汇总       | 今日汇总       | 变化金额       | 变化率      |
 |------------|---------------|---------------|----------------|-------------|
-""".format(datetime_now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-           prev_day=prev_day, 
-           latest_day=latest_day)
+""".format(**locals())
 
     # 整体汇总
     total_prev_cost = monthly_result["成本金额_prev"].sum()
@@ -143,10 +167,10 @@ def generate_markdown_report(monthly_result, latest_day, prev_day, output_path):
     total_bw_diff = total_latest_bw - total_prev_bw
 
     # 添加整体表格
-    report_content += "| 成本金额   | {total_prev_cost:,.2f} | {total_latest_cost:,.2f} | {total_cost_diff:+,.2f} | {total_cost_rate:,.2f}% |\n".format(**locals())
-    report_content += "| 计费金额   | {total_prev_revenue:,.2f} | {total_latest_revenue:,.2f} | {total_revenue_diff:+,.2f} | {total_revenue_rate:,.2f}% |\n".format(**locals())
-    report_content += "| 毛利       | {total_prev_profit:,.2f} | {total_latest_profit:,.2f} | {total_profit_diff:+,.2f} | {total_profit_rate:,.2f}% |\n".format(**locals())
-    report_content += "| 计费带宽   | {total_prev_bw:,.2f}G | {total_latest_bw:,.2f}G | {total_bw_diff:+,.2f}G | - |\n".format(**locals())
+    report_content += "| 成本金额   | {total_prev_cost:,.2f} | {total_latest_cost:,.2f} | {total_cost_diff:+.2f} | {total_cost_rate:+.2f}% |\n".format(**locals())
+    report_content += "| 计费金额   | {total_prev_revenue:,.2f} | {total_latest_revenue:,.2f} | {total_revenue_diff:+.2f} | {total_revenue_rate:+.2f}% |\n".format(**locals())
+    report_content += "| 毛利       | {total_prev_profit:,.2f} | {total_latest_profit:,.2f} | {total_profit_diff:+.2f} | {total_profit_rate:+.2f}% |\n".format(**locals())
+    report_content += "| 计费带宽   | {total_prev_bw:,.2f}G | {total_latest_bw:,.2f}G | {total_bw_diff:+.2f}G | - |\n".format(**locals())
 
     report_content += """
 ---
@@ -172,7 +196,38 @@ def generate_markdown_report(monthly_result, latest_day, prev_day, output_path):
         icon = "↑" if profit_diff > 0 else "↓"
         color = "red" if profit_diff > 0 else "green"
 
-        report_content += "| {month} | {profit_prev:,.2f} | {profit_latest:,.2f} | {icon} <font color='{color}'>{profit_diff:+,.2f}</font> | {profit_rate:+,.2f}% | {cost_diff:+,.2f} | {cost_rate:+,.2f}% | {revenue_diff:+,.2f} | {revenue_rate:+,.2f}% | {bw_diff:+,.2f}G |\n".format(**locals())
+        report_content += "| {month} | {profit_prev:,.2f} | {profit_latest:,.2f} | {icon} <font color='{color}'>{profit_diff:+.2f}</font> | {profit_rate:+.2f}% | {cost_diff:+.2f} | {cost_rate:+.2f}% | {revenue_diff:+.2f} | {revenue_rate:+.2f}% | {bw_diff:+.2f}G |\n".format(**locals())
+
+    # 找出波动大于10万的月份，下钻客户维度
+    big_diff_months = monthly_result[abs(monthly_result["毛利_diff"]) > 100000]
+    if len(big_diff_months) > 0:
+        report_content += """
+---
+
+## 三、大波动月份客户明细（毛利变化绝对值 > 10万）
+"""
+
+        for _, month_row in big_diff_months.iterrows():
+            month = month_row["月份"]
+            customer_result = calculate_customer_dimension(df, latest_day, prev_day, month)
+            if len(customer_result) > 0:
+                report_content += """
+### %s （毛利变化 %+.2f）
+
+| 客户名称 | 昨日毛利 | 今日毛利 | 毛利变化 | 变化率 |
+|----------|----------|----------|----------|--------|
+""".format(month, month_row["毛利_diff"])
+
+                for _, cust_row in customer_result.iterrows():
+                    cname = cust_row["客户_new"]
+                    if pd.isna(cname) or str(cname).strip() == "":
+                        continue
+                    p_prev = cust_row["毛利_new_prev"]
+                    p_latest = cust_row["毛利_new_latest"]
+                    p_diff = cust_row["毛利_diff"]
+                    p_rate = (p_diff / p_prev * 100) if p_prev !=0 else np.inf
+                    icon = "↑" if p_diff > 0 else "↓"
+                    report_content += "| {cname} | {p_prev:,.2f} | {p_latest:,.2f} | {icon} {p_diff:+.2f} | {p_rate:+.2f}% |\n".format(**locals())
 
     growth_profit = "增长" if total_profit_diff > 0 else "下降"
     growth_revenue = "增长" if total_revenue_diff > 0 else "下降"
@@ -180,28 +235,23 @@ def generate_markdown_report(monthly_result, latest_day, prev_day, output_path):
     
     extra_line = ""
     if len(monthly_result) > 0:
-        diff = monthly_result.iloc[0]['毛利_diff']
-        month = monthly_result.iloc[0]['月份']
-        if diff > 0:
-            extra_line = "4. 最大波动月份：**%s**，毛利变化+%.2f" % (month, diff)
-        else:
-            extra_line = "4. 最大波动月份：**%s**，毛利变化%.2f" % (month, diff)
+        extra_line = "4. 最大波动月份：**%s**，毛利变化%+.2f" % (monthly_result.iloc[0]['月份'], monthly_result.iloc[0]['毛利_diff'])
     
     report_content += """
 ---
 
-## 三、核心结论
-1. 整体毛利环比**{growth_profit}** {total_profit_diff:+,.2f}，增幅{total_profit_rate:+,.2f}%
-2. 整体收入{growth_revenue} {total_revenue_diff:+,.2f}，增幅{total_revenue_rate:+,.2f}%
-3. 整体成本{growth_cost} {total_cost_diff:+,.2f}，增幅{total_cost_rate:+,.2f}%
-{extra_line}
-""".format(**locals())
+## 四、核心结论
+1. 整体毛利环比**%s** %+.2f，增幅%+.2f%%
+2. 整体收入%s %+.2f，增幅%+.2f%%
+3. 整体成本%s %+.2f，增幅%+.2f%%
+%s
+""" % (growth_profit, total_profit_diff, total_profit_rate, growth_revenue, total_revenue_diff, total_revenue_rate, growth_cost, total_cost_diff, total_cost_rate, extra_line)
 
     # 写入文件
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report_content)
 
-    print("报告已生成: {output_path}".format(**locals()))
+    print("报告已生成: %s" % output_path)
     return report_content
 
 def extract_core_conclusion(markdown_content):
@@ -358,72 +408,6 @@ if __name__ == "__main__":
     WECHAT_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=36887f02-3fcf-46ac-a13f-69ddf0ddb595"
     USE_TEST_WEBHOOK = True  # 使用测试webhook
 
-    # 1. 获取数据
-    print("===== 开始获取数据 =====")
-    # 当前月份动态筛选：当月3号及以后选本月，否则选上月
-    today = datetime.now()
-    if today.day >= 3:
-        filter_month = today.strftime("%Y-%m")
-    else:
-        # 计算上月
-        last_month = today.replace(day=1) - timedelta(days=1)
-        filter_month = last_month.strftime("%Y-%m")
-    
-    print("筛选月份: {filter_month}")
-    
-    fc = FilterCondition()
-    fc.eq("合并月份", filter_month).ne("客户_new", "七牛CDN")
-    token = get_token()
-    result2 = GuanDataFetcher.fetch_data(
-        token=token, ds_id="eff95e2a2fe0048dfb9727b1", filter_condition=fc, limit=50000
-    )
-    col = result2.get("columns", [])
-    colnames = [col[i]["name"] for i in range(len(col))]
-    df2 = pd.DataFrame(result2.get("preview", []), columns=colnames)
-    print("获取数据完成，共 {len(df2)} 行")
-
-    # 2. 数据预处理
-    print("\n===== 开始数据预处理 =====")
-    df = load_and_preprocess_data(df2)
-    print("预处理完成")
-
-    # 3. 获取对比日期
-    latest_day, prev_day = get_compare_days(df)
-    if latest_day is None or prev_day is None:
-        print("❌ 数据不足两天，无法分析")
-        exit(1)
-    print("分析日期: {prev_day} (昨日) → {latest_day} (今日)")
-
-    # 4. 计算月度指标对比
-    print("\n===== 开始计算月度指标对比 =====")
-    monthly_result = calculate_monthly_metrics(df, latest_day, prev_day)
-    print("计算完成，共 {len(monthly_result)} 个月份符合条件")
-
-    # 5. 生成分析报告
-    print("\n===== 生成分析报告 =====")
-    report = generate_markdown_report(monthly_result, latest_day, prev_day, OUTPUT_REPORT_PATH)
-
-    # 6. 推送至企业微信机器人（测试版）
-    if ENABLE_WECHAT_PUSH:
-        print("\n正在推送报告到企业微信测试版...")
-        send_to_wechat_webhook(WECHAT_WEBHOOK, report, OUTPUT_REPORT_PATH)
-
-    # 打印核心结论
-    print("\n===== 核心结论 =====")
-    total_prev_profit = monthly_result["毛利_new_prev"].sum()
-    total_latest_profit = monthly_result["毛利_new_latest"].sum()
-    total_profit_diff = total_latest_profit - total_prev_profit
-    total_profit_rate = (total_profit_diff / total_prev_profit * 100) if total_prev_profit !=0 else np.inf
-    print(
-        "总毛利变化: %+.2f (%+.2f%%)" % (total_profit_diff, total_profit_rate)
-    )
-    if len(monthly_result) > 0:
-        month = monthly_result.iloc[0]['月份']
-        diff = monthly_result.iloc[0]['毛利_diff']
-        print(
-            "最大波动月份: %s，毛利变化%+.2f" % (month, diff)
-        )
-
 
 if __name__ == "__main__":
     # 配置
@@ -436,55 +420,66 @@ if __name__ == "__main__":
 
     # 1. 获取数据
     print("===== 开始获取数据 =====")
-    # 动态筛选月份范围：
-    # 如果今天 >= 3号，筛选范围为【四个月前 ~ 当月】
-    # 如果今天 < 3号，筛选范围为【五个月前 ~ 上个月】
+    # 动态确定需要包含的月份范围：
+    # 如果今天 >= 3号，筛选范围为【三个月前 ~ 当月】
+    # 如果今天 < 3号，筛选范围为【四个月前 ~ 上个月】
     today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    
+    today_date = today.date()
+    yesterday_date = yesterday.date()
+    
     if today.day >= 3:
-        # 四个月前到当月
+        # 三个月前到当月
         end_month = today.strftime("%Y-%m")
-        # 计算四个月前
-        start_datetime = today.replace(day=1) - timedelta(days=4*30)
+        # 计算三个月前
+        start_datetime = today.replace(day=1) - timedelta(days=3*30)
         start_month = start_datetime.strftime("%Y-%m")
     else:
-        # 五个月前到上个月
+        # 四个月前到上个月
         # 计算上个月
         end_datetime = today.replace(day=1) - timedelta(days=1)
         end_month = end_datetime.strftime("%Y-%m")
-        # 计算五个月前
-        start_datetime = end_datetime.replace(day=1) - timedelta(days=5*30)
+        # 计算四个月前
+        start_datetime = end_datetime.replace(day=1) - timedelta(days=4*30)
         start_month = start_datetime.strftime("%Y-%m")
     
     print("筛选月份范围: %s ~ %s" % (start_month, end_month))
+    print("对比两天: %s (昨日) vs %s (今日)" % (yesterday_date, today_date))
     
-    # 获取所有月份数据，分多次获取合并
+    # 查询所有符合月份范围并排除七牛CDN，分别查询两天
     token = get_token()
     col = None
     all_preview = []
     colnames = []
     
-    # 遍历从start_month到end_month之间的所有月份
     # 生成月份列表
+    months = []
     current = datetime.strptime(start_month, "%Y-%m")
     end_datetime = datetime.strptime(end_month, "%Y-%m")
     while current <= end_datetime:
-        current_month_str = current.strftime("%Y-%m")
-        print("正在获取 %s 月份数据..." % current_month_str)
-        fc = FilterCondition()
-        fc.eq("合并月份", current_month_str).ne("客户_new", "七牛CDN")
-        result = GuanDataFetcher.fetch_data(
-            token=token, ds_id="eff95e2a2fe0048dfb9727b1", filter_condition=fc, limit=50000
-        )
-        if col is None:
-            col = result.get("columns", [])
-            colnames = [col[i]["name"] for i in range(len(col))]
-        preview = result.get("preview", [])
-        all_preview.extend(preview)
-        # 移动到下一个月
+        months.append(current.strftime("%Y-%m"))
         if current.month == 12:
             current = current.replace(year=current.year + 1, month=1)
         else:
             current = current.replace(month=current.month + 1)
+    
+    # 分别查询昨天和今天
+    for query_date in [yesterday_date, today_date]:
+        print("正在获取 %s 数据..." % query_date)
+        for month in months:
+            fc = FilterCondition()
+            # 日期等于查询日期，排除七牛CDN，合并月份等于当前月份
+            fc.eq("统计日期", query_date.strftime("%Y-%m-%d")).ne("客户_new", "七牛CDN").eq("合并月份", month)
+            result = GuanDataFetcher.fetch_data(
+                token=token, ds_id="eff95e2a2fe0048dfb9727b1", filter_condition=fc, limit=20000
+            )
+            if not colnames:
+                col = result.get("columns", [])
+                colnames = [col[i]["name"] for i in range(len(col))]
+            preview = result.get("preview", [])
+            all_preview.extend(preview)
+            print("  - %s: got %d rows" % (month, len(preview)))
     
     df2 = pd.DataFrame(all_preview, columns=colnames)
     print("全部获取完成，共 %d 行" % len(df2))
@@ -495,10 +490,8 @@ if __name__ == "__main__":
     print("预处理完成")
 
     # 3. 获取对比日期
-    latest_day, prev_day = get_compare_days(df)
-    if latest_day is None or prev_day is None:
-        print("❌ 数据不足两天，无法分析")
-        exit(1)
+    latest_day = today_date
+    prev_day = yesterday_date
     print("分析日期: %s (昨日) → %s (今日)" % (prev_day, latest_day))
 
     # 4. 计算月度指标对比
@@ -508,7 +501,7 @@ if __name__ == "__main__":
 
     # 5. 生成分析报告
     print("\n===== 生成分析报告 =====")
-    report = generate_markdown_report(monthly_result, latest_day, prev_day, OUTPUT_REPORT_PATH)
+    report = generate_markdown_report(df, monthly_result, latest_day, prev_day, OUTPUT_REPORT_PATH)
 
     # 6. 推送至企业微信机器人（测试版）
     if ENABLE_WECHAT_PUSH:
