@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MongoDB到StarRocks同步工具流程说明</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Microsoft YaHei', sans-serif;
+        }
+        body {
+            background-color: #f5f7fa;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+            padding: 30px;
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 15px;
+        }
+        h2 {
+            color: #2c3e50;
+            margin: 25px 0 15px;
+            color: #34495e;
+            border-left: 4px solid #3498db;
+            padding-left: 12px;
+        }
+        h3 {
+            color: #3498db;
+            margin: 15px 0 10px;
+        }
+        .section {
+            margin-bottom: 25px;
+        }
+        .card {
+            background-color: #f8f9fa;
+            border-radius: 6px;
+            padding: 18px;
+            margin-bottom: 15px;
+            border-left: 4px solid #2ecc71;
+        }
+        .config-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+        }
+        .config-table th, .config-table td {
+            padding: 10px;
+            border: 1px solid #e1e8ed;
+            text-align: left;
+        }
+        .config-table th {
+            background-color: #3498db;
+            color: #fff;
+        }
+        .steps {
+            list-style: none;
+            counter-reset: step-counter;
+        }
+        .steps li {
+            counter-increment: step-counter;
+            margin-bottom: 12px;
+            padding: 12px;
+            background-color: #f8f9fa;
+            border-radius: 6px;
+            position: relative;
+            padding-left: 50px;
+        }
+        .steps li::before {
+            content: counter(step-counter);
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            background-color: #3498db;
+            color: #fff;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 28px;
+            font-weight: bold;
+        }
+        .highlight {
+            background-color: #fff3cd;
+            padding: 10px;
+            border-radius: 4px;
+            border-left: 4px solid #ffc107;
+            margin: 10px 0;
+        }
+        .func-list {
+            list-style: none;
+        }
+        .func-list li {
+            margin-bottom: 10px;
+            padding: 8px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+        .func-name {
+            font-weight: bold;
+            color: #e74c3c;
+            font-family: monospace;
+            font-size: 16px;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            color: #7f8c8d;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>MongoDB到StarRocks数据同步工具流程说明</h1>
+
+        <div class="section">
+            <h2>一、工具概述</h2>
+            <div class="card">
+                <p>本工具实现MongoDB到StarRocks的全量+增量数据同步，支持断点续传、自动类型转换、错误回滚等特性。</p>
+                <ul>
+                    <li>✅ 全量同步：首次同步所有历史数据</li>
+                    <li>✅ 增量同步：基于更新时间字段同步增量数据</li>
+                    <li>✅ 断点续传：同步中断后可从上次断点继续执行</li>
+                    <li>✅ 自动类型转换：处理MongoDB特殊类型（ObjectId、Decimal128等）</li>
+                    <li>✅ 批量插入：每1000条提交一次，提升同步效率</li>
+                    <li>✅ 错误回滚：同步失败自动回滚事务，保证数据一致性</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>二、核心配置</h2>
+            <table class="config-table">
+                <thead>
+                    <tr>
+                        <th>配置项</th>
+                        <th>说明</th>
+                        <th>示例值</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td colspan="3"><strong>MongoDB配置</strong></td>
+                    </tr>
+                    <tr>
+                        <td>host/port</td>
+                        <td>MongoDB服务地址端口</td>
+                        <td>10.34.137.87:37018</td>
+                    </tr>
+                    <tr>
+                        <td>username/password</td>
+                        <td>认证信息</td>
+                        <td>nodeDayOpsWide_r</td>
+                    </tr>
+                    <tr>
+                        <td>db/collection</td>
+                        <td>源库/集合名</td>
+                        <td>jarvis.nodeDayOpsWide</td>
+                    </tr>
+                    <tr>
+                        <td>batch_size</td>
+                        <td>批次拉取大小</td>
+                        <td>1000</td>
+                    </tr>
+                    <tr>
+                        <td>incremental_field</td>
+                        <td>增量同步时间字段</td>
+                        <td>updatedTime</td>
+                    </tr>
+                    <tr>
+                        <td colspan="3"><strong>StarRocks配置</strong></td>
+                    </tr>
+                    <tr>
+                        <td>host/port</td>
+                        <td>StarRocks服务地址端口</td>
+                        <td>10.70.33.22:9030</td>
+                    </tr>
+                    <tr>
+                        <td>user/password</td>
+                        <td>认证信息</td>
+                        <td>srtest</td>
+                    </tr>
+                    <tr>
+                        <td>db/table</td>
+                        <td>目标库/表名</td>
+                        <td>test.node_day_ops_wide</td>
+                    </tr>
+                    <tr>
+                        <td colspan="3"><strong>其他配置</strong></td>
+                    </tr>
+                    <tr>
+                        <td>CHECKPOINT_FILE</td>
+                        <td>断点存储文件路径</td>
+                        <td>./sync_checkpoint.json</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section">
+            <h2>三、核心工具函数</h2>
+            <ul class="func-list">
+                <li>
+                    <span class="func-name">to_datetime(val)</span>
+                    <p>将任意类型（时间戳、字符串）转换为datetime对象，支持秒/毫秒时间戳、多种时间字符串格式</p>
+                </li>
+                <li>
+                    <span class="func-name">bson_to_json_serializable(obj)</span>
+                    <p>处理MongoDB特殊类型转换：ObjectId转字符串、Decimal128转Decimal、datetime转标准格式字符串、列表/字典转JSON字符串</p>
+                </li>
+                <li>
+                    <span class="func-name">flatten_doc(doc, prefix="")</span>
+                    <p>递归展开嵌套文档，将嵌套字段转换为"父字段_子字段"的扁平结构，便于关系型数据库存储</p>
+                </li>
+                <li>
+                    <span class="func-name">load_checkpoint() / save_checkpoint()</span>
+                    <p>加载/保存同步断点，记录最后同步ID、最后更新时间、同步模式（全量/增量）</p>
+                </li>
+                <li>
+                    <span class="func-name">get_sr_connection() / get_mongo_collection()</span>
+                    <p>获取StarRocks数据库连接和MongoDB集合对象</p>
+                </li>
+            </ul>
+        </div>
+
+        <div class="section">
+            <h2>四、全量同步流程</h2>
+            <ol class="steps">
+                <li>加载断点文件，获取上次同步的最后ID和进度</li>
+                <li>建立MongoDB和StarRocks数据库连接</li>
+                <li>构建查询条件：若存在断点则查询大于最后ID的数据，否则查询所有数据</li>
+                <li>按批次（1000条/批）从MongoDB拉取数据，按_id升序排序</li>
+                <li>对每条数据执行扁平化处理和类型转换</li>
+                <li>补全缺失字段为None，与StarRocks表字段顺序对齐</li>
+                <li>批量插入到StarRocks，每批提交一次事务</li>
+                <li>每批插入完成后更新断点并保存到文件，记录当前进度</li>
+                <li>所有数据同步完成后，将同步模式更新为"incremental"，保存最终断点</li>
+                <li>关闭数据库连接，输出同步完成信息</li>
+            </ol>
+            <div class="highlight">
+                <strong>注意：</strong>全量同步失败会自动回滚当前批次未提交的事务，断点不会更新，下次启动会从上次成功的断点继续执行。
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>五、增量同步流程</h2>
+            <ol class="steps">
+                <li>加载断点文件，检查是否为增量模式，若不是则提示先完成全量同步</li>
+                <li>建立MongoDB和StarRocks数据库连接</li>
+                <li>从断点获取最后同步的更新时间，若不存在则默认同步最近7天的数据</li>
+                <li>构建增量查询条件：更新时间 >= 最后同步时间</li>
+                <li>按批次拉取数据，按更新时间升序排序</li>
+                <li>数据扁平化、类型转换处理（同全量同步）</li>
+                <li>使用INSERT ... ON DUPLICATE KEY UPDATE语法插入，主键为(customerId, day, nodeId)</li>
+                <li>每批提交一次事务，记录本次同步最大的更新时间</li>
+                <li>所有增量数据同步完成后，更新断点中的最后更新时间</li>
+                <li>关闭数据库连接，输出增量同步完成信息</li>
+            </ol>
+        </div>
+
+        <div class="section">
+            <h2>六、错误处理机制</h2>
+            <div class="card">
+                <h3>事务回滚</h3>
+                <p>同步过程中发生任何异常，自动回滚当前批次未提交的所有数据，保证数据一致性，不会产生部分插入的脏数据。</p>
+            </div>
+            <div class="card">
+                <h3>断点保护</h3>
+                <p>只有当批次数据成功提交到StarRocks后，才会更新断点文件，即使同步中断，下次启动也能从上次成功提交的位置继续，不会重复同步数据。</p>
+            </div>
+            <div class="card">
+                <h3>数据类型适配</h3>
+                <p>自动处理MongoDB到StarRocks的类型转换，包括：
+                    <ul>
+                        <li>ObjectId -> 字符串</li>
+                        <li>Decimal128 -> Decimal高精度类型</li>
+                        <li>datetime -> 标准时间字符串</li>
+                        <li>嵌套文档/数组 -> JSON字符串</li>
+                    </ul>
+                </p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>七、使用方式</h2>
+            <div class="card">
+                <p><strong>全量同步命令：</strong></p>
+                <code>python3 mongodb2starRocks.py full</code>
+                <p><strong>增量同步命令：</strong></p>
+                <code>python3 mongodb2starRocks.py incremental</code>
+                <p><strong>后台运行：</strong></p>
+                <code>nohup python3 mongodb2starRocks.py full > sync_full.log 2>&1 &</code>
+                <p><strong>查看进度：</strong></p>
+                <code>tail -f sync_full.log</code>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>MongoDB to StarRocks Sync Tool | 版本 1.0</p>
+        </div>
+    </div>
+</body>
+</html>

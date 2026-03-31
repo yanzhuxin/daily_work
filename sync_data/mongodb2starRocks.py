@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import pymongo
+from pymongo import MongoClient
+import pymysql
+import json
+import os
+import decimal
+import logging
+from bson import ObjectId, Decimal128, Int64
+from datetime import datetime, timedelta
+
+# 配置
+MONGO_CONFIG = {
+    "host": "10.34.137.87",
+    "port": 37018,
+    "username": "nodeDayOpsWide_r",
+    "password": "pRkuawfIRKXkRQu1nhTLYhjF96QpAyXXYou",
+    "auth_db": "jarvis",
+    "db": "jarvis",
+    "collection": "nodeDayOpsWide",
+    "batch_size": 10000,
+    "incremental_field": "updatedTime",
+}
+
+STARROCKS_CONFIG = {
+    "host": "10.70.33.22",
+    "port": 9030,
+    "user": "srtest",
+    "password": "srtest@890",
+    "db": "test",
+    "table": "node_day_ops_wide",
+}
+
+# 断点文件路径
+CHECKPOINT_FILE = "./sync_checkpoint.json"
+
+# 企业微信推送配置
+WECHAT_WEBHOOK = {
+    "enable": True,
+    "key": "0d04ba7b-40e4-4502-bcce-bcbc60a2bfd4",
+}
+
+# 初始化日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+def to_datetime(val):
+    """任意类型转datetime对象"""
+    if isinstance(val, datetime):
+        return val
+    elif isinstance(val, (int, float)):
+        # 时间戳格式，支持秒和毫秒
+        if val > 1e12:
+            val = val / 1000
+        return datetime.fromtimestamp(val)
+    elif isinstance(val, str):
+        # 字符串格式时间
+        if len(val) == 23:  # 带毫秒的格式 %Y-%m-%d %H:%M:%S.%f
+            return datetime.strptime(val, "%Y-%m-%d %H:%M:%S.%f")
+        elif len(val) == 19:  # 不带毫秒的格式 %Y-%m-%d %H:%M:%S
+            return datetime.strptime(val, "%Y-%m-%d %H:%M:%S")
+        else:
+            return datetime.strptime(val, "%Y-%m-%d %H:%M:%S.%f")
+    else:
+        raise ValueError(f"无法转换为时间: {type(val)} = {val}")
+
+
+def bson_to_json_serializable(obj):
+    """处理MongoDB特殊类型"""
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    elif isinstance(obj, Int64) or type(obj).__name__ == "Int32":
+        # 兼容不同版本bson的Int32类型，不需要导入直接通过类型名判断
+        return int(obj)
+    elif isinstance(obj, Decimal128):
+        return obj.to_decimal()
+    elif isinstance(obj, datetime):
+        return obj.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    elif isinstance(obj, (list, dict)):
+        try:
+            return json.dumps(obj, default=bson_to_json_serializable, ensure_ascii=False)
+        except ValueError:
+            # 处理循环引用
+            return str(obj)
+    else:
+        return obj
+
+
+def flatten_doc(doc, prefix=""):
+    """嵌套文档展开为扁平结构"""
+    flat = {}
+    for k, v in doc.items():
+        key = f"{prefix}{k}" if prefix else k
+        if isinstance(v, dict):
+            flat.update(flatten_doc(v, key + "_"))
+        elif isinstance(v, (list, dict)):
+            flat[key] = bson_to_json_serializable(v)
+        else:
+            flat[key] = bson_to_json_serializable(v)
+    return flat
+
+
+def load_checkpoint():
+    """加载上次同步断点"""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"last_id": None, "last_updated_time": None, "sync_type": "full"}
+
+
+def save_checkpoint(checkpoint):
+    """保存同步断点"""
+    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+        json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+
+
+def get_sr_connection():
+    """获取StarRocks连接"""
+    return pymysql.connect(
+        host=STARROCKS_CONFIG["host"],
+        port=STARROCKS_CONFIG["port"],
+        user=STARROCKS_CONFIG["user"],
+        password=STARROCKS_CONFIG["password"],
+        database=STARROCKS_CONFIG["db"],
+        charset="utf8mb4",
+        autocommit=False,
+    )
+
+
+def get_mongo_collection():
+    """获取MongoDB集合"""
+    client = MongoClient(
+        host=MONGO_CONFIG["host"],
+        port=MONGO_CONFIG["port"],
+        username=MONGO_CONFIG["username"],
+        password=MONGO_CONFIG["password"],
+        authSource=MONGO_CONFIG["auth_db"],
+    )
+    db = client[MONGO_CONFIG["db"]]
+    return db[MONGO_CONFIG["collection"]]
+
+
+def sync_full():
+    """全量同步"""
+    global time_breakdown
+    logger.info("=== 开始全量同步 ===")
+    checkpoint = load_checkpoint()
+    logger.info(f"加载断点完成: last_id={checkpoint.get('last_id')}, sync_type={checkpoint.get('sync_type')}")
+
+    logger.info("正在连接MongoDB...")
+    coll = get_mongo_collection()
+    logger.info("MongoDB连接完成")
+
+    logger.info("正在连接StarRocks...")
+    sr_conn = get_sr_connection()
+    sr_cursor = sr_conn.cursor()
+    logger.info("StarRocks连接完成")
+
+    # 构建查询条件
+    query = {}
+    if checkpoint["last_id"]:
+        query["_id"] = {"$gt": ObjectId(checkpoint["last_id"])}
+        logger.info(f"断点续传，只查询 _id > {checkpoint['last_id']} 的数据")
+    else:
+        logger.info("从头开始全量同步，查询所有数据")
+
+    # 字段映射，和建表SQL顺序一致
+    fields = [
+        "customerId",
+        "day",
+        "nodeId",
+        "analyzePeak95",
+        "baseInfo_channelId",
+        "baseInfo_signatoryId",
+        "baseInfo_bandwidth",
+        "buildBandwidth",
+        "city",
+        "cost_guaranteedRate",
+        "cost_priceItemId",
+        "cost_priceItemName",
+        "cost_priceType",
+        "cost_price",
+        "cost_priceAfterBonus",
+        "cost_measure",
+        "cost_original",
+        "cost_bonus",
+        "cost_slaDeduction",
+        "cost_tobaDeduction",
+        "cost_settlement",
+        "cost_adjustmentAmount",
+        "cost_finalAmount",
+        "customerName",
+        "deliveryType",
+        "evening20To23Avg",
+        "eveningAvg",
+        "eveningPeak95",
+        "isBanTransProv",
+        "isp",
+        "name",
+        "natType",
+        "nodeTags",
+        "nodeType",
+        "os",
+        "peak95",
+        "peak95Ratio",
+        "peak95Time",
+        "peakMaxRatio",
+        "priceNumber",
+        "profit_profitAmount",
+        "profit_profitRate",
+        "profit_estimatedProfitAmount",
+        "profit_estimatedProfitRate",
+        "province",
+        "purchaserName",
+        "quantityEnd",
+        "quantityType",
+        "realISP",
+        "resourceType",
+        "revenue_guaranteedRate",
+        "revenue_priceItemId",
+        "revenue_priceItemName",
+        "revenue_price",
+        "revenue_measure",
+        "revenue_coefficientMeasure",
+        "revenue_amount",
+        "revenue_finalAmount",
+        "revenue_estimatedFinalAmount",
+        "signatoryName",
+        "snapshotTime",
+        "stage",
+        "stairType",
+        "stairs",
+        "state",
+        "tcpNatType",
+        "udpNatType",
+        "unEveningAvg",
+        "updatedTime",
+        "vendorId",
+        "vendorSuggestCustomers",
+        "virtualCustomers",
+        "webPort",
+        "webPortResult",
+    ]
+
+    placeholder = ", ".join(["%s"] * len(fields))
+    insert_sql = f"INSERT INTO {STARROCKS_CONFIG['table']} ({', '.join(fields)}) VALUES ({placeholder})"
+
+    count = 0
+    last_id = checkpoint["last_id"]
+    last_updated_time = checkpoint["last_updated_time"]
+    batch = []
+    batch_size = MONGO_CONFIG["batch_size"]
+    logger.info(f"批量大小设置为: {batch_size}")
+
+    try:
+        logger.info("开始执行MongoDB全量查询...")
+        cursor = coll.find(query).sort("_id", 1).batch_size(batch_size)
+        logger.info("MongoDB游标创建完成，开始遍历数据...")
+
+        for doc in cursor:
+            step_start = datetime.now()
+            # 记录读取MongoDB时间
+            read_end = datetime.now()
+            time_breakdown['read_mongo'] += (read_end - step_start).total_seconds()
+
+            process_start = datetime.now()
+            flat_doc = flatten_doc(doc)
+            # 补全缺失字段为None
+            row = [flat_doc.get(field, None) for field in fields]
+            batch.append(row)
+
+            count += 1
+            last_id = str(doc["_id"])
+            last_updated_time = bson_to_json_serializable(
+                doc.get(MONGO_CONFIG["incremental_field"])
+            )
+
+            # 记录数据处理时间
+            process_end = datetime.now()
+            time_breakdown['process'] += (process_end - process_start).total_seconds()
+
+            if len(batch) == batch_size:
+                write_start = datetime.now()
+                sr_cursor.executemany(insert_sql, batch)
+                sr_conn.commit()
+                batch.clear()
+                checkpoint.update(
+                    {
+                        "last_id": last_id,
+                        "last_updated_time": last_updated_time,
+                        "sync_type": "full",
+                    }
+                )
+                save_checkpoint(checkpoint)
+                # 记录写入时间
+                write_end = datetime.now()
+                time_breakdown['write_sr'] += (write_end - write_start).total_seconds()
+                logger.info(f"已同步 {count} 条，断点已保存，最后ID: {last_id}")
+                step_start = datetime.now()
+
+        # 插入剩余数据
+        if batch:
+            write_start = datetime.now()
+            sr_cursor.executemany(insert_sql, batch)
+            sr_conn.commit()
+            write_end = datetime.now()
+            time_breakdown['write_sr'] += (write_end - write_start).total_seconds()
+            logger.info(f"已同步剩余 {len(batch)} 条")
+
+        # 全量同步完成，更新断点为增量模式
+        checkpoint.update(
+            {
+                "last_id": last_id,
+                "last_updated_time": last_updated_time,
+                "sync_type": "incremental",
+            }
+        )
+        save_checkpoint(checkpoint)
+        logger.info(f"全量同步完成，共同步 {count} 条数据，已切换到增量模式")
+        logger.info(f"用时统计 - 读取MongoDB: {time_breakdown['read_mongo']:.2f}s, 数据处理: {time_breakdown['process']:.2f}s, 写入StarRocks: {time_breakdown['write_sr']:.2f}s, 数据校验: {time_breakdown['verify']:.2f}s")
+
+    except Exception as e:
+        sr_conn.rollback()
+        logger.info(f"全量同步失败: {str(e)}")
+        raise
+    finally:
+        sr_cursor.close()
+        sr_conn.close()
+
+    return count
+
+
+def sync_incremental():
+    """增量同步"""
+    global time_breakdown
+    logger.info("=== 开始增量同步 ===")
+    checkpoint = load_checkpoint()
+    logger.info(f"加载断点完成: last_updated_time={checkpoint.get('last_updated_time')}, sync_type={checkpoint.get('sync_type')}")
+
+    if checkpoint["sync_type"] != "incremental":
+        logger.info("当前不是增量模式，请先完成全量同步")
+        return 0
+
+    step_start = datetime.now()
+    logger.info("正在连接MongoDB...")
+    coll = get_mongo_collection()
+    logger.info("MongoDB连接完成")
+
+    logger.info("正在连接StarRocks...")
+    sr_conn = get_sr_connection()
+    sr_cursor = sr_conn.cursor()
+    logger.info("StarRocks连接完成")
+
+    last_updated_time = checkpoint.get("last_updated_time")
+    if not last_updated_time:
+        last_updated_time = (datetime.now() - timedelta(days=7)).strftime(
+            "%Y-%m-%d %H:%M:%S.%f"
+        )[:-3]
+        logger.info(f"未找到上次更新时间，默认使用一周前: {last_updated_time}")
+    else:
+        logger.info(f"使用断点更新时间: {last_updated_time}")
+
+    # 增量查询：更新时间大于上次同步时间
+    query = {
+        MONGO_CONFIG["incremental_field"]: {
+            "$gte": datetime.strptime(last_updated_time, "%Y-%m-%d %H:%M:%S.%f")
+        }
+    }
+    logger.info(f"构建增量查询条件完成: 更新时间 >= {last_updated_time}")
+
+    # 字段映射和全量一致
+    logger.info(f"准备查询MongoDB，批量大小: {MONGO_CONFIG['batch_size']}")
+    fields = [
+        "customerId",
+        "day",
+        "nodeId",
+        "analyzePeak95",
+        "baseInfo_channelId",
+        "baseInfo_signatoryId",
+        "baseInfo_bandwidth",
+        "buildBandwidth",
+        "city",
+        "cost_guaranteedRate",
+        "cost_priceItemId",
+        "cost_priceItemName",
+        "cost_priceType",
+        "cost_price",
+        "cost_priceAfterBonus",
+        "cost_measure",
+        "cost_original",
+        "cost_bonus",
+        "cost_slaDeduction",
+        "cost_tobaDeduction",
+        "cost_settlement",
+        "cost_adjustmentAmount",
+        "cost_finalAmount",
+        "customerName",
+        "deliveryType",
+        "evening20To23Avg",
+        "eveningAvg",
+        "eveningPeak95",
+        "isBanTransProv",
+        "isp",
+        "name",
+        "natType",
+        "nodeTags",
+        "nodeType",
+        "os",
+        "peak95",
+        "peak95Ratio",
+        "peak95Time",
+        "peakMaxRatio",
+        "priceNumber",
+        "profit_profitAmount",
+        "profit_profitRate",
+        "profit_estimatedProfitAmount",
+        "profit_estimatedProfitRate",
+        "province",
+        "purchaserName",
+        "quantityEnd",
+        "quantityType",
+        "realISP",
+        "resourceType",
+        "revenue_guaranteedRate",
+        "revenue_priceItemId",
+        "revenue_priceItemName",
+        "revenue_price",
+        "revenue_measure",
+        "revenue_coefficientMeasure",
+        "revenue_amount",
+        "revenue_finalAmount",
+        "revenue_estimatedFinalAmount",
+        "signatoryName",
+        "snapshotTime",
+        "stage",
+        "stairType",
+        "stairs",
+        "state",
+        "tcpNatType",
+        "udpNatType",
+        "unEveningAvg",
+        "updatedTime",
+        "vendorId",
+        "vendorSuggestCustomers",
+        "virtualCustomers",
+        "webPort",
+        "webPortResult",
+    ]
+
+    placeholder = ", ".join(["%s"] * len(fields))
+    # StarRocks主键表(PRIMARY KEY)INSERT自动UPSERT，不需要ON DUPLICATE KEY UPDATE
+    insert_sql = f"""
+    INSERT INTO {STARROCKS_CONFIG["table"]} ({", ".join(fields)}) 
+    VALUES ({placeholder})
+    """
+
+    count = 0
+    max_updated_time = last_updated_time
+    batch = []
+    batch_size = MONGO_CONFIG["batch_size"]
+
+    try:
+        logger.info("开始执行MongoDB查询...")
+        cursor = (
+            coll.find(query)
+            .sort(MONGO_CONFIG["incremental_field"], 1)
+            .batch_size(MONGO_CONFIG["batch_size"])
+        )
+        logger.info(f"MongoDB游标创建完成，开始遍历数据，批量大小: {batch_size}")
+
+        for doc in cursor:
+            step_start = datetime.now()
+            # 记录读取MongoDB时间
+            read_end = datetime.now()
+            time_breakdown['read_mongo'] += (read_end - step_start).total_seconds()
+
+            process_start = datetime.now()
+            flat_doc = flatten_doc(doc)
+            row = [flat_doc.get(field, None) for field in fields]
+            batch.append(row)
+
+            count += 1
+            current_updated_time_raw = doc[MONGO_CONFIG["incremental_field"]]
+            current_updated_time = bson_to_json_serializable(current_updated_time_raw)
+            # 统一转成datetime对象比较，避免类型错误
+            if to_datetime(current_updated_time_raw) > to_datetime(max_updated_time):
+                max_updated_time = current_updated_time
+
+            # 记录数据处理时间
+            process_end = datetime.now()
+            time_breakdown['process'] += (process_end - process_start).total_seconds()
+
+            if len(batch) == batch_size:
+                write_start = datetime.now()
+                sr_cursor.executemany(insert_sql, batch)
+                sr_conn.commit()
+                batch.clear()
+                checkpoint.update(
+                    {
+                        "last_updated_time": max_updated_time,
+                        "sync_type": "incremental",
+                    }
+                )
+                save_checkpoint(checkpoint)
+                # 记录写入时间
+                write_end = datetime.now()
+                time_breakdown['write_sr'] += (write_end - write_start).total_seconds()
+                logger.info(f"已同步增量 {count} 条，已提交事务，断点已更新")
+
+                step_start = datetime.now()
+
+        # 插入剩余数据
+        if batch:
+            write_start = datetime.now()
+            sr_cursor.executemany(insert_sql, batch)
+            sr_conn.commit()
+            checkpoint.update(
+                {
+                    "last_updated_time": max_updated_time,
+                    "sync_type": "incremental",
+                }
+            )
+            save_checkpoint(checkpoint)
+            write_end = datetime.now()
+            time_breakdown['write_sr'] += (write_end - write_start).total_seconds()
+
+        logger.info(f"遍历完成，总共同步 {count} 条，断点已更新")
+        # 更新增量断点
+        checkpoint["last_updated_time"] = max_updated_time
+        save_checkpoint(checkpoint)
+        logger.info(f"增量同步完成，共同步 {count} 条数据，最新更新时间: {max_updated_time}")
+        logger.info(f"用时统计 - 读取MongoDB: {time_breakdown['read_mongo']:.2f}s, 数据处理: {time_breakdown['process']:.2f}s, 写入StarRocks: {time_breakdown['write_sr']:.2f}s, 数据校验: {time_breakdown['verify']:.2f}s")
+
+    except Exception as e:
+        sr_conn.rollback()
+        logger.info(f"增量同步失败: {str(e)}")
+        raise
+    finally:
+        sr_cursor.close()
+        sr_conn.close()
+
+    return count
+
+
+def send_wechat_report(start_time, end_time, sync_count, sync_type, time_breakdown, check_result):
+    """发送同步报告到企业微信"""
+    if not WECHAT_WEBHOOK["enable"]:
+        logger.info("企业微信推送已关闭，跳过推送")
+        return
+
+    import requests
+
+    total_duration = (end_time - start_time).total_seconds()
+    minutes = int(total_duration // 60)
+    seconds = int(total_duration % 60)
+
+    # 构建报告内容
+    content = f"""**📊 MongoDB→StarRocks数据同步完成**
+
+**同步类型**: {sync_type}
+**同步数据量**: {sync_count:,} 条
+**总用时**: {minutes}分{seconds}秒
+
+    **用时分布**:
+- 读取MongoDB: {time_breakdown['read_mongo']:.2f}秒 ({(time_breakdown['read_mongo']/total_duration*100):.1f}%)
+- 数据处理: {time_breakdown['process']:.2f}秒 ({(time_breakdown['process']/total_duration*100):.1f}%)
+- 写入StarRocks: {time_breakdown['write_sr']:.2f}秒 ({(time_breakdown['write_sr']/total_duration*100):.1f}%)
+- 数据校验: {time_breakdown['verify']:.2f}秒 ({(time_breakdown['verify']/total_duration*100):.1f}%)
+
+**数据校验结果**:
+- MongoDB总量: {check_result['mongo_total']:,}
+- StarRocks总量: {check_result['sr_total']:,}
+- 差异: {check_result['diff']}
+
+{"✅ 数据完全一致，同步成功！" if check_result['diff'] == 0 else "⚠️ 数据不一致，请检查！"}
+"""
+
+    webhook_url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECHAT_WEBHOOK['key']}"
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {
+            "content": content
+        }
+    }
+
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=10)
+        result = resp.json()
+        if result.get("errcode") == 0:
+            logger.info("✅ 同步报告已推送至企业微信")
+        else:
+            logger.error(f"❌ 推送失败: {result.get('errmsg')}")
+    except Exception as e:
+        logger.error(f"❌ 推送异常: {str(e)}")
+
+
+def verify_data_count(last_updated_time):
+    """校验两边数据量是否一致"""
+    global time_breakdown
+    logger.info("\n=== 开始数据校验 ===")
+    start_verify = datetime.now()
+
+    # 连接MongoDB统计
+    coll = get_mongo_collection()
+    dt = datetime.strptime(last_updated_time, "%Y-%m-%d %H:%M:%S.%f")
+    mongo_total = coll.count_documents({})
+
+    # 连接StarRocks统计
+    conn = get_sr_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) as count FROM %s" % STARROCKS_CONFIG["table"])
+    result = cursor.fetchone()
+    sr_total = result[0] if result else 0
+    cursor.close()
+    conn.close()
+
+    end_verify = datetime.now()
+    time_breakdown['verify'] += (end_verify - start_verify).total_seconds()
+
+    diff = mongo_total - sr_total
+    logger.info(f"MongoDB总量: {mongo_total:,}, StarRocks总量: {sr_total:,}, 差异: {diff}")
+
+    if diff == 0:
+        logger.info("✅ 数据校验通过，两边数据量一致")
+    else:
+        logger.error("⚠️ 数据校验失败，两边数据量不一致")
+
+    return {
+        "mongo_total": mongo_total,
+        "sr_total": sr_total,
+        "diff": diff
+    }
+
+
+if __name__ == "__main__":
+    import sys
+    import requests
+
+    if len(sys.argv) < 2:
+        logger.info("Usage: python mongodb2starRocks.py [full|incremental]")
+        sys.exit(1)
+
+    # 全局计时变量
+    time_breakdown = {
+        "read_mongo": 0,
+        "process": 0,
+        "write_sr": 0,
+        "verify": 0,
+    }
+
+    mode = sys.argv[1]
+    start_time = datetime.now()
+
+    sync_count = 0
+    last_updated_time = None
+
+    if mode == "full":
+        sync_count = sync_full()
+        checkpoint = load_checkpoint()
+        last_updated_time = checkpoint.get("last_updated_time")
+    elif mode == "incremental":
+        sync_count = sync_incremental()
+        checkpoint = load_checkpoint()
+        last_updated_time = checkpoint.get("last_updated_time")
+    else:
+        logger.info(f"未知模式: {mode}，支持 full 或 incremental")
+        sys.exit(1)
+
+    # 数据校验
+    check_result = verify_data_count(last_updated_time)
+    end_time = datetime.now()
+
+    # 发送企业微信报告
+    if WECHAT_WEBHOOK["enable"] and sync_count is not None:
+        send_wechat_report(start_time, end_time, sync_count, mode, time_breakdown, check_result)
+
